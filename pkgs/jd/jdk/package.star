@@ -1,0 +1,71 @@
+# OpenJDK from source, headless (no X11 in the set yet), booted by jdk-bootstrap.
+def package(c):
+    pkgs, build = c.pkgs, c.buildPkgs
+    return c.package(
+        name = "jdk",
+        # HotSpot's LoongArch port is Loongson's fork, not in mainline
+        platforms = {"cpu": ["x86_64", "aarch64", "riscv64", "powerpc64le"]},
+        dependencies = [
+            pkgs.zlib,
+            pkgs.libpng,
+            pkgs.freetype,
+            pkgs["alsa-lib"],
+            pkgs.libffi,
+            pkgs["cups-headers"],  # headers only, for the target
+            pkgs["fontconfig-headers"],
+        ],
+        buildDependencies = [
+            build["jdk-bootstrap"],
+            build.autoconf,  # the repo ships no generated configure
+            build.bash,
+            build.zip,
+            build.unzip,
+        ] + c.on(c.platform.cross, [build.jdk]),
+        patches = [path("upstream-riscv-float-type.patch")],
+        phases = [
+            {
+                "name": "configure",
+                "run": c.lib.text("""
+                    # jdk.jpackage uses std::nothrow without <new> (libstdc++ and older libc++ had it
+                    # transitively). tstrings.h is the header all of it includes
+                    let h = "src/jdk.jpackage/share/native/common/tstrings.h"
+                    open --raw $h | str replace "#include <string>" "#include <new>\\n#include <string>" | save -f $h
+                    # not autotools proper: its own wrapper, and it wants bash
+                    let cross = (if $c.platform.cross {
+                      [$"--openjdk-target=($c.platform.gnuTriple)" $"--with-build-jdk=(tool-root jdk)" $"BUILD_CC=($env.CC_FOR_BUILD)" $"BUILD_CXX=($env.CXX_FOR_BUILD)"]
+                    } else { [] })
+                    (x bash configure ...$cross
+                      $"--prefix=($c.out)"
+                      $"--with-boot-jdk=(tool java | path dirname | path dirname)"
+                      --with-toolchain-type=clang
+                      --enable-headless-only
+                      --disable-warnings-as-errors
+                      --disable-precompiled-headers
+                      --with-native-debug-symbols=internal
+                      --with-stdc++lib=dynamic
+                      --with-zlib=system --with-libpng=system --with-freetype=system
+                      --with-giflib=bundled --with-libjpeg=bundled --with-lcms=bundled --with-harfbuzz=bundled
+                      $"--with-cups-include=(dep-root cups-headers cups)/include"
+                      $"--with-fontconfig-include=(dep-root fontconfig-headers fontconfig)/include"
+                      $"--with-jobs=($c.njobs)"
+                      --with-version-build=1 --with-version-pre= --with-version-opt=pkgs
+                      --with-vendor-name=pkgs
+                      # reproducible: fixed timestamps and "build user". jar --date rejects anything before
+                      # 1980-01-01T00:00:02Z (DOS time, 2 s granularity), two seconds past SOURCE_DATE_EPOCH
+                      --with-source-date=315532802 --with-hotspot-build-time=1980-01-01T00:00:02
+                      --with-build-user=pkgs)
+                """),
+            },
+            {"name": "build", "run": "x make images JOBS=($c.njobs) LOG=info"},
+            {
+                "name": "install",
+                "run": c.lib.text("""
+                    let img = (glob build/*/images/jdk | first)
+                    mkdir $c.out
+                    for d in [bin conf include jmods lib release] { cp -r $"($img)/($d)" $c.out }
+                """),
+            },
+        ],
+        bin = ["java", "javac", "jar"],
+        exports = False,
+    )

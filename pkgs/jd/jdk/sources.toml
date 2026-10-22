@@ -1,0 +1,14 @@
+[upstream]
+purl = "pkg:github/openjdk/jdk25u"
+
+[watch] # -ga tags only. The API lists 600 build tags newest-build-first
+url = "https://github.com/openjdk/jdk25u/tags"
+regex = "jdk-(25[0-9.]*)-ga"
+
+[[source]]
+key = "default"
+url = "https://github.com/openjdk/jdk25u/archive/refs/tags/jdk-{version}-ga.tar.gz"
+hash = "sha256-i5PZZbIcHviwOQ5I41LDJxjbS64AOXudk1cXXFUypUo="
+
+[pin]
+version = "25.0.4.1"

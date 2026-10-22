@@ -1,0 +1,20 @@
+# cmake definitions shared by every llvm<N>
+DEFS = {
+    "LLVM_TARGETS_TO_BUILD": "X86;AArch64;RISCV;LoongArch;PowerPC;ARM;WebAssembly;BPF",
+    "LLVM_LINK_LLVM_DYLIB": True,
+    "LLVM_BUILD_LLVM_DYLIB": True,
+    "BUILD_SHARED_LIBS": False,
+    "LLVM_ENABLE_ZLIB": "FORCE_ON",
+    "LLVM_ENABLE_ZSTD": "FORCE_ON",
+    "LLVM_ENABLE_LIBXML2": False,
+    "LLVM_ENABLE_TERMINFO": False,
+    "LLVM_ENABLE_LIBEDIT": False,
+    "LLVM_ENABLE_LIBPFM": False,
+    "LLVM_ENABLE_BINDINGS": False,
+    "LLVM_INCLUDE_TESTS": False,
+    "LLVM_INCLUDE_BENCHMARKS": False,
+    "LLVM_INCLUDE_EXAMPLES": False,
+    "LLVM_INCLUDE_DOCS": False,
+    "LLVM_INSTALL_UTILS": False,
+    "LLVM_PARALLEL_LINK_JOBS": 4,
+}

@@ -1,0 +1,12 @@
+# libLLVM of the major zig links against (update.nu tracks it). clang21 and lld21 build on it
+def package(c):
+    return c.variant(c.pkgs.llvm, {
+        # upstream a558d656 (LLVM 22): RDF specialised std::less/equal_to, which libc++ 23's
+        # transparent-comparator machinery rejects
+        "patches": {"set": [
+            path("upstream-rdf-std-specializations.patch"),
+            path("upstream-x86-vastart-stack-probe.patch"),  # the llvm/ one rebased onto 21's pass class
+        ]},
+        # zig's cmake refuses an LLVM that lacks a default target
+        "cmake": {"defs": {"merge": {"LLVM_TARGETS_TO_BUILD": "all"}}},
+    })

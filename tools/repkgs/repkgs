@@ -1,0 +1,175 @@
+#!/usr/bin/env nu
+# One entry point for working on the set. Every subcommand is a thin wrapper that ends in
+# nix-build, nix, uptrack, jigd or treefmt: `repkgs <cmd> --help` shows what it runs.
+use nix.nu *
+use dev.nu *
+
+def main []: nothing -> nothing { help main }
+
+# build packages through the compile cache
+def "main build" [
+  --for: string # platform, e.g. aarch64-linux, x86_64-windows-gnu
+  ...attrs: string # package attributes (jq, jq.tests)
+]: nothing -> nothing {
+  if ($attrs | is-empty) { fail "repkgs build <attr>…, or nix-build -A ci for the whole set" }
+  ^nix-build (root) ...$XP --no-out-link --log-format bar-with-logs ...(cache-args) ...(platform-arg $for) ...($attrs | each {|a| [-A $a] } | flatten)
+}
+
+# build <pkg>.tests (tests.separate packages), or the package itself when it tests in-build.
+# No attrs: the builder's own tests (tests/builder), run those after editing builder/
+def "main test" [
+  --for: string # platform
+  ...attrs: string
+]: nothing -> nothing {
+  if ($attrs | is-empty) {
+    ^nix-build $"(root)/tests/builder" ...$XP --no-out-link --log-format bar-with-logs ...(cache-args) ...(platform-arg $for)
+    return
+  }
+  let targets = ($attrs | each {|a| if (eval $"(pkg-expr $a $for) ? tests") { $"($a).tests" } else { $a } })
+  main build --for=$for ...$targets
+}
+
+# the build log of a package's derivation
+def "main log" [
+  --for: string # platform
+  attr: string
+]: nothing -> nothing {
+  let d = (drv $attr $for)
+  let r = (^nix ...$XP log $d | complete)
+  if $r.exit_code != 0 { fail $"no local log for ($d): built elsewhere or substituted, `repkgs build` it here first" }
+  print $r.stdout
+}
+
+# packages a platform supports, or the ones it does not and why
+def "main list" [
+  --for: string # platform
+  --unsupported # show what `supported` filters out, with the reason
+  --json (-j) # machine-readable
+]: nothing -> any {
+  let set = (set-expr $for)
+  let rows = (if $unsupported {
+    eval $"let s = ($set); in map \(n: { name = n; reason = s.${n}.unsupportedReason; }\) \(builtins.filter \(n: !s.${n}.supported\) \(builtins.attrNames s\)\)"
+  } else {
+    eval $"let s = ($set); in builtins.filter \(n: s.${n}.supported\) \(builtins.attrNames s\)"
+  })
+  if $json { $rows | to json } else if $unsupported { $rows } else { $rows | wrap name }
+}
+
+# version, platform support, build systems and features of one package without building it
+def "main info" [
+  --for: string # platform
+  --json (-j) # machine-readable: the full record
+  attr: string
+]: nothing -> any {
+  let p = (eval $"let p = (pkg-expr $attr $for); in { name = p.pname; version = p.version or null; platform = p.platform; supported = p.supported; reason = p.unsupportedReason; uses = p.args.uses or []; features = builtins.mapAttrs \(n: d: d // { value = p.features.${n}; }\) \(p.args.features or {}\); }")
+  if $json { return ($p | to json) }
+  print ({name: $p.name, version: $p.version, platform: $p.platform, uses: ($p.uses | str join " ")}
+    | merge (if $p.supported { {} } else { {unsupported: $p.reason} }))
+  if ($p.features | is-not-empty) {
+    print ($p.features | transpose feature f | each {|r| {feature: $r.feature, value: ($r.f.value | to nuon), values: ($r.f.values? | default [] | str join " | "), doc: ($r.f.doc? | default "")} } | table -i false)
+  }
+}
+
+# the options every build system accepts (<name>.* in a package.nix): builder/systems/<name>.nu OPTIONS
+def "main options" [
+  --json (-j) # machine-readable: { <system> = { <option> = { default, doc, type? } } }
+  ...systems: string # build systems, default all
+]: nothing -> any {
+  let dir = $"(root)/builder/systems"
+  let have = (ls --short-names $dir | get name | where { $in ends-with .nu } | each { str replace .nu "" })
+  let names = (if ($systems | is-empty) { $have } else { $systems | uniq })
+  let unknown = ($names | where $it not-in $have)
+  if ($unknown | is-not-empty) { fail $"no build system '($unknown | str join ' ')', have: ($have | str join ' ')" }
+  let all = ($names | each {|bs| {$bs: (^$nu.current-exe --no-config-file -c $"use ($dir)/($bs).nu; $($bs).OPTIONS | to nuon" | from nuon)} } | into record)
+  if $json { return ($all | to json) }
+  let common = "every system also takes `root` (directory below the source), those with a tool `tool` (the package providing it) and those with lock files `deps` (the fetched dependencies, by default from the package's own lock file)"
+  print $"($common)\n"
+  for bs in $names {
+    print $"## ($bs)\n"
+    print ($all | get $bs | transpose option v | each {|r| {option: $"`($bs).($r.option)`", type: ($r.v.type? | default ($r.v.default | describe | str replace -r '<.*' "")), default: ($r.v.default | to nuon), meaning: $r.v.doc} } | to md --pretty)
+    print ""
+  }
+}
+
+# a new package directory with sources.toml from a purl and url template (uptrack init)
+def "main new" [
+  name: string # attribute name
+  purl: string # pkg:github/owner/repo, pkg:pypi/name, pkg:gnu/name, …
+  url: string # source url with {version} {tag} {major} {minor}
+]: nothing -> nothing {
+  let dir = $"(root)/pkgs/($name | str substring 0..<2)/($name)"
+  if ($dir | path exists) { fail $"($dir) exists" }
+  try { ^$"(root)/pkgs/up/uptrack/src/uptrack" init $dir $purl $url } catch {
+    rm -rf $dir
+    fail $"uptrack init failed for ($purl), nothing written"
+  }
+  if not ($"($dir)/package.nix" | path exists) {
+    $"{\n  package,\n  pkgs,\n}:\npackage {\n  name = \"($name)\";\n  uses = [ \"autotools\" ];\n}\n" | save $"($dir)/package.nix"
+  }
+  print -e $"($dir): edit package.nix, then repkgs build ($name)"
+}
+
+# versions and lock tables: uptrack check | apply | lock | verify | rehash | list
+def --wrapped "main update" [...args: string]: nothing -> nothing {
+  ^$"(root)/pkgs/up/uptrack/src/uptrack" ...$args
+}
+
+# rebuild and compare against the store (nix-build --check)
+def "main repro" [
+  --for: string # platform
+  ...attrs: string # default: zlib xz pcre2 jq sqlite ncurses
+]: nothing -> table {
+  let attrs = (if ($attrs | is-empty) { [zlib xz pcre2 jq sqlite ncurses] } else { $attrs })
+  $attrs | each {|a|
+    let build = (^nix-build (root) ...$XP -A $a --no-out-link ...(cache-args) ...(platform-arg $for) | complete)
+    if $build.exit_code != 0 { return {attr: $a, status: build-failed} }
+    # --check compiles for real: no cache
+    let check = (^nix-build (root) ...$XP -A $a --no-out-link --check --keep-failed ...(platform-arg $for) | complete)
+    {attr: $a, status: (if $check.exit_code == 0 { "reproducible" } else if $check.stderr =~ "may not be deterministic|differs" { "DIFFERS" } else { "check-failed" })}
+  }
+}
+
+# the compile cache daemon: start | stop | status
+def "main cache" [
+  action: string # start, stop or status
+  --size: int = 50 # GiB before whole packs are evicted (start)
+]: nothing -> nothing {
+  let dir = (jigd-dir)
+  let sock = $"($dir)/socket"
+  let pidfile = $"($dir)/pid"
+  match $action {
+    "start" => {
+      if (is-socket $sock) { print -e $"jigd already serving ($sock)"; return }
+      mkdir $dir
+      rm -f $sock
+      let jigd = (^nix-build (root) ...$XP -A jigd --no-out-link | str trim)
+      let pid = (^sh -c $"JIGD_SIZE=($size) setsid ($jigd)/bin/jigd ($sock) >($dir)/log 2>&1 & echo $!" | str trim)
+      $pid | save -f $pidfile
+      print -e $"jigd pid ($pid), socket ($sock), log ($dir)/log"
+    }
+    "stop" => { if ($pidfile | path exists) { ^kill (open --raw $pidfile | str trim); rm -f $pidfile $sock } }
+    "status" => {
+      let s = (jigd-socket)
+      if $s == null { print "jigd: not running"; return }
+      print $"jigd: ($s)"
+      if ($"($dir)/log" | path exists) { ^tail -n 3 $"($dir)/log" }
+    }
+    _ => { fail "repkgs cache start|stop|status" }
+  }
+}
+
+# build seed nars on this machine and upload them (pkgs/se/seed/upload.nu)
+def --wrapped "main seed" [...args: string]: nothing -> nothing {
+  ^$"(root)/pkgs/se/seed/upload.nu" ...$args
+}
+
+# cross build <pkg> for cpus upstream has no binaries for and upload it as <pkg>-bootstrap's source (tools/upload-bootstrap.nu)
+def --wrapped "main bootstrap" [...args: string]: nothing -> nothing {
+  ^$"(root)/tools/upload-bootstrap.nu" ...$args
+}
+
+# format and lint the tree (treefmt)
+def --wrapped "main fmt" [...args: string]: nothing -> nothing {
+  cd (root)
+  ^treefmt ...$args
+}

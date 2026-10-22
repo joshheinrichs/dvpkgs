@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# tools/parity [PLATFORM…]: every package (and separate test suite) of dvpkgs against
+# nix-instantiate on repkgs, by .drv path. Unsupported packages compare by `supported`.
+#   REPKGS   repkgs checkout (default ../repkgs)
+#   DV       the dv binary (default: dv on PATH)
+#   STORE    Nix store to instantiate into (default: a chroot store in $TMPDIR, so the daemon
+#            needs neither ca-derivations nor dynamic-derivations)
+# Exits non-zero if any package differs, or fails on one side only.
+set -euo pipefail
+here=$(cd "$(dirname "$0")/.." && pwd)
+REPKGS=${REPKGS:-$here/../repkgs}
+DV=${DV:-dv}
+STORE=${STORE:-local?root=${TMPDIR:-/tmp}/dvpkgs-parity}
+system=$(nix-instantiate --eval -E builtins.currentSystem | tr -d '"')
+platforms=("$@")
+[ ${#platforms[@]} -gt 0 ] || platforms=("$system")
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+status=0
+
+for p in "${platforms[@]}"; do
+  # name -> [drv, tests drv | null], "UNSUPPORTED", or "ERROR"; read-write: dynamic
+  # derivations need their producers written for builtins.outputOf. tryEval does not catch a
+  # throw from inside derivationStrict: a package that fails is named by the error, marked and
+  # the set evaluated again
+  failing='[ ]'
+  while :; do
+    if NIX_CONFIG='extra-experimental-features = ca-derivations dynamic-derivations nix-command' \
+      nix-instantiate --read-write-mode --store "$STORE" --eval --strict --json -E "
+        let
+          set = import $REPKGS { system = \"$system\"; platform = \"$p\"; };
+        in builtins.mapAttrs (n: v:
+          if builtins.elem n $failing then \"ERROR\"
+          else if !(v.supported or true) then \"UNSUPPORTED\"
+          else [ v.drvPath (if v ? tests then v.tests.drvPath else null) ]) set" \
+      > "$work/nix.json" 2> "$work/nix.err"; then
+      break
+    fi
+    n=$(grep -o "while evaluating attribute '[^']*'" "$work/nix.err" | head -1 | cut -d"'" -f2)
+    if [ -z "$n" ] || [[ $failing == *"\"$n\""* ]]; then cat "$work/nix.err" >&2; exit 2; fi
+    failing="${failing% ]} \"$n\" ]"
+  done
+  jq -r 'to_entries[] |
+        if (.value|type) == "array" then
+          "pkgs.\(.key)\t\(.value[0])", (select(.value[1] != null) | "pkgs.\(.key).tests\t\(.value[1])")
+        else "pkgs.\(.key)\t\(.value)" end' "$work/nix.json" \
+    | LC_ALL=C sort > "$work/want"
+
+  printf 'load("//nix/set.star", "package_set")\npkgs = package_set(system = "%s", platform = "%s")\n' "$system" "$p" > "$work/set.star"
+  args=()
+  while IFS=$'\t' read -r a d; do
+    if [ "$d" = UNSUPPORTED ]; then args+=(-A "$a.supported"); else args+=(-A "$a"); fi
+  done < "$work/want"
+  "$DV" --no-cache instantiate --root "$here" "$work/set.star" "${args[@]}" 2> "$work/err" \
+    | sed 's/\.supported\tFalse$/\tUNSUPPORTED/; s/\terror$/\tERROR/' | LC_ALL=C sort > "$work/got" || true
+
+  if ! LC_ALL=C join -t $'\t' -a 1 -a 2 -e MISSING -o 0,1.2,2.2 "$work/want" "$work/got" | awk -F'\t' -v p="$p" '
+      $2 == $3 { ok++; next }
+      { bad++; print "  " $1 ": nix " $2 ", dv " $3 }
+      END { printf "%s: %d agree, %d differ\n", p, ok, bad; exit bad > 0 }'; then
+    status=1
+    grep '^error:' "$work/err" | head -5 | sed 's/^/  /' || true
+  fi
+done
+exit $status

@@ -1,0 +1,43 @@
+#!/usr/bin/env nu
+# Run cross-built packages on a real machine via .github/workflows/target-test.yaml:
+#   tools/target-test x86_64-windows-gnu jq curl zstd
+# builds them, packs the closure, uploads it as a release asset, dispatches the workflow with
+# `bin/<x> --version` per package (or tests.version), and follows the run.
+const REPO = "Mic92/repkgs"
+const RUNNER = {
+  x86_64-windows-gnu: windows-latest, x86_64-windows-msvc: windows-latest, aarch64-windows-msvc: windows-11-arm
+  aarch64-macos: macos-latest, x86_64-macos: macos-13, aarch64-linux: ubuntu-24.04-arm, aarch64-linux-musl: ubuntu-24.04-arm
+}
+
+# --remote: build and pack on that host (repo rsynced to /scratch/$USER/<basename>), $NIX_BUILD for
+# its nix-build command line
+def main [platform: string, --remote (-r): string, ...attrs: string] {
+  let runner = ($RUNNER | get $platform)
+  let on = {|cmd: string| if $remote == null { ^bash -c $cmd } else { ^ssh $remote $"cd /scratch/($env.USER)/(pwd | path basename) && ($cmd)" } }
+  let outs = (do $on $"($env.NIX_BUILD? | default nix-build) . ($attrs | each { $'-A ($in)' } | str join ' ') --argstr platform ($platform) --no-out-link" | lines | where { $in =~ '^/nix/store' })
+  if ($outs | length) != ($attrs | length) { error make {msg: "build failed"} }
+  let exe = (if $platform =~ windows { ".exe" } else { "" })
+  # as finish.nu version-check: spec.bin or bin/<name> when the build made one, libraries just unpack
+  let commands = ($attrs | zip $outs | each {|p|
+    let spec = (^nix-instantiate --eval --json --strict -E $"with import ./. { platform = \"($platform)\"; }; { v = ($p.0).version; t = ($p.0).spec.tests.version or true; b = ($p.0).spec.bin or []; }" | from json)
+    let b = (if ($spec.b | is-empty) and (do $on $"test -e ($p.1)/bin/($p.0)($exe)" | complete).exit_code == 0 { [$p.0] } else { $spec.b })
+    if $spec.t == false or ($b | is-empty) { return $"ls ($p.1)" }
+    let words = (if $spec.t == true { [($b | first) --version] } else { $spec.t | split row " " })
+    let words = (if $words.0 in $b { $words } else { [($b | first)] ++ $words })
+    $"($p.1)/bin/($words.0)($exe) ($words | skip 1 | str join ' ') | grep -F ($spec.v | str replace -r '-r[0-9]+$' '')"
+  })
+  let tar = $"/tmp/target-test-($platform).tar.gz"
+  let pack = $"nix-store -qR ($outs | str join ' ') | grep -v -- '-debug$' | tar -C / -czf - -T -"
+  ^bash -c (if $remote == null { $"($pack) > ($tar)" } else { $"ssh ($remote) ($pack | to json) > ($tar)" })
+  let tag = "target-test"
+  if (^gh release view $tag -R $REPO | complete).exit_code != 0 { ^gh release create $tag -R $REPO --prerelease --notes "payloads for .github/workflows/target-test.yaml" --title $tag }
+  ^gh release upload $tag $tar -R $REPO --clobber
+  let url = $"https://github.com/($REPO)/releases/download/($tag)/($tar | path basename)"
+  print ($commands | str join "\n")
+  ^gh workflow run target-test.yaml -R $REPO -f $"runner=($runner)" -f $"url=($url)" -f $"commands=($commands | str join "\n")"
+  sleep 5sec
+  let id = (^gh run list -R $REPO -w target-test.yaml -L 1 --json databaseId | from json | get 0.databaseId)
+  print $"https://github.com/($REPO)/actions/runs/($id)"
+  ^gh run watch $id -R $REPO --exit-status
+  ^gh run view $id -R $REPO --log | lines | where { $in =~ '\brun\b' } | each { str replace -r '^\S+\s+\S+\s+\S+\s' '' } | print
+}

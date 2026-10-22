@@ -1,0 +1,14 @@
+# librhash only. Hand-written configure with its own option names
+def package(c):
+    platform = c.platform
+    return c.package(
+        name = "rhash",
+        uses = ["make"],
+        # its configure knows linux, darwin, mingw. Not msvc
+        platforms = {"abi": ["gnu", "apple"]},
+        make = {
+            "configureFlags": ["--enable-lib-shared", "--disable-gettext"] + c.on(platform.cross, ["--target=" + platform.gnuTriple]),
+            "buildTarget": ["lib-shared"],
+            "installTarget": ["-C", "librhash", "install-lib-shared", "install-lib-headers"] + ([] if platform.os == "windows" else ["install-so-link"]),
+        },
+    )
